@@ -1,0 +1,23 @@
+.switchboard/
+vendor/bundle/
+
+# Environment files with real credentials — never commit these
+.env.test
+.env
+.env.local
+
+# Ignore key files for decrypting credentials and more.
+/config/*.key
+
+# Logs and temp files
+/log/*
+/tmp/*
+!/log/.keep
+!/tmp/.keep
+
+# Storage (uploaded files)
+/storage/*
+!/storage/.keep
+
+# Ignore bundler config
+/.bundle
