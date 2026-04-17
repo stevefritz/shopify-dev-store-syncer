@@ -6,25 +6,46 @@ This doc is read alongside `CLAUDE.md` and the pinned `raw-spec-notes` spec. It 
 
 ---
 
-## 1. Philosophy: test contracts, not wiring
+## 0. Test pyramid
+
+Not every test lives at the same layer. Default suite mix:
+
+| Layer | Purpose | Speed | Uses Shopify fixtures? | ~% of suite |
+|---|---|---|---|---|
+| **Unit** | Pure-logic helpers (delta computation, error-code lookup, `OrphanPolicy.decide`, JSONL stitcher, translation-table builder). | Microseconds | No — inline minimal inputs are fine and preferred. | ~60% |
+| **Contract** | Each domain's public method surface; verifies the promise. | Milliseconds | Real fixtures for Shopify-shape round-trips; factories otherwise. | ~25% |
+| **Integration** | Cross-domain flows with recorded Shopify responses (VCR-style). | Seconds | Real fixtures, played back. | ~10% |
+| **Invariant / system** | The 7 system invariants (§3), end-to-end against the test dev store. | Minutes | Live dev store. | ~5% |
+
+The pyramid shape is not cosmetic. A suite weighted toward integration/live-store tests is slow, flaky, and expensive to run — meaning it gets run less, which defeats the point. Keep the fast layers thick; reserve the slow ones for things only they can verify.
+
+---
+
+## 1. Philosophy: prefer contracts, allow meaningful interaction tests
 
 A **contract test** asserts a public promise: *given this input, the output has this property.*
 
 A **wiring test** asserts an implementation detail: *this method called that method with these arguments.*
 
-**We write contract tests.** Wiring tests break on refactor, create a shadow copy of the implementation that drifts, and — most importantly for this project — are trivially fakeable. An agentic task that writes a wiring test, mocks the thing it's testing, and asserts the mock was called has produced nothing of value while showing green.
+**Default to contract tests.** They survive refactoring and test what callers actually depend on. But some things are *inherently* about interaction and belong as explicit tests:
 
-**The heuristic:** if a reasonable refactor of the implementation would break the test, it's probably a wiring test. Rewrite it.
+- **State machine transitions.** "From `submitted`, on `poll_complete`, transition to `fetched`" is a wiring-shaped test and it's the right test for a state machine.
+- **Retry counts and back-off.** "After 3 `RETRY_SAME_INPUT` failures, promote to `NO_RETRY`" is an interaction assertion; it's also exactly what the retry policy promises.
+- **Regression nails.** When a specific bug is fixed, a test that locks in "this specific thing won't happen again" is legitimate even if it looks like wiring.
+
+**The heuristic:** if a **minor** refactor (renaming a private method, restructuring a loop, changing a query shape) would break the test, it's probably wiring and should be rewritten. If a **major** refactor (swapping ActiveRecord, rewriting an entire phase) would break it — that's fine; major refactors warrant test churn.
+
+Mock the **collaborators** of the thing under test; never mock the thing under test itself. A unit test of `OrphanPolicy.decide` that stubs a logger is fine. A test of `OrphanPolicy.decide` that stubs `OrphanPolicy.decide` is fraud.
 
 ### Concrete examples for p2d
 
-**Good (contract):** Given a real Shopify JSONL fixture (captured from a live pull), after ingestion into Mirror, a re-pull against the same source store produces byte-identical JSONL (modulo ordering). *This verifies the mirror is lossless without knowing anything about how ingestion is implemented.*
+**Good (contract):** Given a real Shopify JSONL fixture, after ingestion into Mirror, a re-pull against the same source store produces byte-identical JSONL (modulo ordering). *Verifies the mirror is lossless without caring how ingestion is implemented.*
 
-**Bad (wiring):** `Pull::Ingester#call` invokes `Mirror::Product.upsert!` N times for N input rows. *This tests that we wrote a loop. It will pass even if the loop does nothing meaningful.*
+**Good (legit interaction):** A PhaseRun transitions `submitted → polling → fetched → stamped → done` in that order when each corresponding event fires, and refuses transitions that skip states. *State machines need transition-level tests; this is not wiring.*
 
-**Good (contract):** Given source Mirror state X, scope Y, and orphan policy Z, running Phase 3 produces a destination Shopify state matching the expectation derived from (X, Y, Z). Real dev store, real API call, real result. *This verifies the phase does what it claims.*
+**Bad (wiring masquerading as a test):** `Pull::Ingester#call` invokes `Mirror::Product.upsert!` N times for N input rows. *Tests that we wrote a loop. Passes even if the loop does nothing meaningful.*
 
-**Bad (wiring):** `Phase3#run` calls `Mirror::Product.where(store: source).stamped_in(dest).not_exists` to compute input. *This tests the query we happen to use. Tomorrow's query is different and the test breaks without the system getting worse.*
+**Bad (wiring):** `Phase3#run` calls `Mirror::Product.where(store: source).stamped_in(dest).not_exists` to compute input. *Tests today's query shape, not the delta-input invariant.* The correct test: "after Phase 3 runs, the set of stamped dest records equals scope minus previously-stamped."
 
 ---
 
@@ -34,7 +55,7 @@ Contract tests need **real reference data**, not hand-typed approximations of wh
 
 ### Rules
 
-- **Every Shopify-touching test uses fixtures captured from a real Shopify dev store.** Not hand-written JSON. Not docstring examples. Real JSONL from real GraphQL calls.
+- **Shopify-shape round-trip and ingest tests use fixtures captured from a real Shopify dev store.** Not hand-written JSON. Not docstring examples. Real JSONL from real GraphQL calls. This rule is scoped to tests that assert something about *Shopify's data shape* — ingest correctness, round-trip fidelity, stitching, error-response parsing. Pure-logic helpers that happen to work on Shopify-shaped types (delta computation, error-code classification, JSONL-line-building) are allowed inline minimal inputs, which are often clearer than a full fixture.
 - **Fixtures carry provenance metadata** as a sibling `.meta.yml` file: which store, which API version, which query or mutation, capture timestamp, capture script version.
 - **Fixtures are regenerated by script, never edited by hand.** A `bin/capture-fixtures` (or equivalent) script runs against the project's test dev store and refreshes the fixture set. The script is the source of truth for fixture content.
 - **Fixtures are committed to the repo.** Yes, they're large. Yes, they belong in git. Testing depends on their stability.
@@ -59,6 +80,76 @@ Captured from the project's test dev store (see §6):
 - `translatableResources` response
 
 Expect ~50-200MB of fixtures. That's fine. They're the test oracle.
+
+---
+
+## 2.5 Database during tests
+
+The test suite runs against **in-memory SQLite** (`config/database.yml` test block uses `adapter: sqlite3, database: ":memory:"`). Dev and production run against Postgres via docker-compose. This is a deliberate, hard constraint — CC dispatches multiple agents in parallel worktrees, and a shared Postgres creates port and schema contention that ruins that model.
+
+### The hard portability rule
+
+**No Postgres-specific SQL in application code. Ever.**
+
+Banned in default-path code:
+- JSON operators: `->`, `->>`, `@>`, `?`, `jsonb_*()` functions
+- Array columns (we don't need them)
+- `tsvector` / full-text search built on Postgres extensions
+- Any `execute("postgres-specific SQL")` block
+
+There is **no escape hatch**. No `@postgres_only` tag, no excluded-from-default-suite pattern. If a feature requires Postgres semantics, the feature is wrong for this codebase — rewrite it as Ruby-level logic or a portable query.
+
+### Column type for JSON-shaped values
+
+Use `t.text` with `serialize :field, coder: JSON` at the model layer. Example:
+
+```ruby
+# migration
+create_table :mirror_metafields do |t|
+  t.text :value   # JSON-encoded string, opaque to SQL
+  ...
+end
+
+# model
+class Mirror::Metafield < ApplicationRecord
+  serialize :value, coder: JSON
+end
+```
+
+Do **not** use `t.jsonb` or `t.json`. Both introduce adapter-specific behavior. `t.text` + `serialize` gives identical read/write semantics on SQLite and Postgres.
+
+Architectural rationale: Mirror is a mirror. We store values; we don't filter, aggregate, or search inside them. If a future feature wants JSON-inside queries, that's the signal to extract the searched field as its own column, not to reach for JSONB.
+
+### FK enforcement in SQLite
+
+SQLite disables foreign key enforcement by default. Enable it via a connection initializer:
+
+```ruby
+# config/initializers/sqlite_foreign_keys.rb
+ActiveSupport.on_load(:active_record) do
+  if connection.adapter_name.downcase.include?("sqlite")
+    connection.execute("PRAGMA foreign_keys = ON")
+  end
+end
+```
+
+Without this, SQLite silently orphans children on parent delete; Postgres raises. With it, they behave identically. Do not remove this initializer.
+
+### Portability gotchas to watch for
+
+Most divergence is eliminated by "no JSON operators, no arrays, FK on." What remains:
+
+- **NULL ordering in `ORDER BY`**: explicit `NULLS LAST` (or `NULLS FIRST`) whenever ordering on nullable columns. Implicit behavior differs between SQLite and Postgres.
+- **`LIKE` case sensitivity**: SQLite is case-insensitive by default; Postgres is case-sensitive. We don't do fuzzy string search, but if you ever do, use `LOWER()` on both sides.
+- **`upsert_all` behavior**: Rails abstracts `ON CONFLICT` across adapters. Safe as long as you use the Rails API, not raw SQL.
+
+### The CI compatibility canary
+
+Local dev + test workflow: SQLite for tests (fast, zero services).
+CI main job: SQLite for tests (fast feedback).
+CI parity job: runs the full test suite against real Postgres on each push. This is the drift detector — if it fails, the cause is always a portability violation. Fix the code; never exclude the test.
+
+Implication for fixtures: unchanged. Shopify fixtures are captured from a real dev store and live on disk. The DB adapter has nothing to do with fixture capture — it's about what tests do with the fixtures once loaded.
 
 ---
 
@@ -107,6 +198,39 @@ Enforced by a system-level test that explicitly re-enters phases from each possi
 **The `:mirror` (destructive) orphan policy cannot execute without an explicit user confirmation captured as a JobEvent with the `OrphanPolicy.destructive_confirmation_token` field populated.**
 
 Enforced by a system-level test that attempts to run Phase 6 with `:mirror` policy but no confirmation token and asserts the phase refuses, logs, and surfaces an error.
+
+### Invariant 8 — DB-adapter portability
+
+**Every application SQL query runs unchanged on both SQLite (in-memory, test-time) and Postgres (dev/prod).** No `@postgres_only` tags, no excluded-from-default-suite tests, no adapter-specific code paths.
+
+Enforced by: (a) the default test suite running against SQLite, which fails loudly if adapter-specific SQL is used inadvertently; (b) a CI compatibility-canary job that runs the full default suite against real Postgres. Any divergence fails the canary, and the fix is always in application code — never a test exclusion.
+
+---
+
+## 3.5 What NOT to test (anti-bloat rules)
+
+Tests cost maintenance. Tests that don't earn their keep drag on velocity every time the code moves. CC left unchecked will happily generate 50 tests where 5 would do. These rules cap the ceremony.
+
+### Hard no's
+
+- **No tests for trivial delegations.** `def active? = status == :active` does not need a test. `def source_store_id = store_id if store.source?` does not need a test.
+- **No tests that enumerate every ActiveRecord validation.** `validates :name, presence: true` is Rails; trust Rails. One test per model proving the constraint object exists is overkill.
+- **No tests of private methods directly.** Exercise privates through the public surface. If a private method needs its own test, it probably wants to be extracted as its own public thing.
+- **No tests that assert specific log lines or specific event payloads unless the log/event IS the contract.** Audit log content is the contract for observability; random info-level logs are not.
+- **No tests of every combination of inputs for a pure function.** One test per equivalence class (happy path, edge case, error case) is usually enough. Don't enumerate 15 metafield types when 3 representative ones cover the dispatch logic.
+- **No duplicate coverage across layers.** If an integration test proves Phase 3 stamps records correctly, a separate unit test asserting the same thing at the component level is redundant. Pick the cheapest layer that proves it.
+
+### The one-sentence test
+
+Before adding a test, state in one sentence: *what failure does this catch that no existing test catches?* If you can't answer, the test is redundant; delete it.
+
+### Count discipline per unit
+
+As a rule of thumb (not hard limit), a well-scoped public method gets 1–3 tests: happy path, one edge case if there's a non-trivial one, one error case if it has a documented failure mode. A unit of code with 8+ tests is a smell — either the unit is too big, or the tests are redundant, or both.
+
+### The one sentence per test assertion
+
+Each test's primary assertion should state *what behavior is promised*, not *what code executed*. "After Phase 3, Mirror has exactly N stamped records" is a promise. "`upsert!` was called N times" is execution.
 
 ---
 
@@ -195,7 +319,11 @@ Before any CC task dispatches in a given phase, the following must be true. If a
 ### Phase 1 gate (foundation scaffold)
 
 - [ ] Phase 0 gate met
-- [ ] Stack choices reflected in the task spec (Rails 8, Postgres, Solid Queue, Turbo Streams, Rails 8 auth)
+- [ ] Stack choices reflected in the task spec (Rails 8, Postgres dev/prod + in-memory SQLite test, Solid Queue, Turbo Streams, Rails 8 auth)
+- [ ] `config/database.yml` uses Postgres for dev/prod, `adapter: sqlite3, database: ":memory:"` for test
+- [ ] `config/initializers/sqlite_foreign_keys.rb` enables `PRAGMA foreign_keys = ON`
+- [ ] `Gemfile` has `gem "pg"` (dev/prod) and `gem "sqlite3", group: :test`
+- [ ] CI runs `bin/rails test` with zero external services (main job) + a Postgres-parity canary job
 
 ### Phase 2 gate (D1 + D2)
 
@@ -276,13 +404,19 @@ details — describe intent and constraints.]
 In addition to correctness + style, the Opus review must verify:
 
 1. **Every invariant in the task spec has a corresponding test.** Not "a test exists" — *this specific invariant* is verifiable by *this specific test*.
-2. **Every test's assertion survives a reasonable refactor.** The reviewer mentally rewrites the implementation in a different but valid way; if any test would break under that rewrite, the test is wiring. Flag it.
-3. **Every Shopify-touching test uses a real fixture.** Hand-typed JSON in test files is an automatic flag.
+2. **Every test's primary assertion survives a MINOR refactor** (rename private method, restructure loop, change query shape). Tests that fail only on *major* refactor (swap ORM, rewrite phase) are fine. The bar is "would a reader doing cleanup hate this test?", not "is this test perfectly abstract?"
+3. **Shopify-shape round-trip tests use real fixtures.** Pure-logic tests on Shopify-shaped inputs may use inline minimal data. The distinction matters; both should exist.
 4. **No test that mocks the thing under test.** Testing `Phase3` by mocking `Phase3::InputBuilder` and asserting the mock was called is the canonical failure pattern. Reject.
 5. **No bypass of the one-way guarantee.** Any code that writes to a store whose role hasn't been verified as `:destination` is an auto-reject.
-6. **Fixture-based contract tests where fixtures exist.** If a real fixture for the behavior under test is available in the repo, the test must use it rather than constructing equivalent data inline.
+6. **Anti-bloat audit.** The reviewer runs through §3.5 and flags:
+   - Tests of trivial delegations / Rails validations / private methods.
+   - Redundant tests across layers (if X is proven at integration level, don't also test X at unit level).
+   - Tests whose one-sentence description ("what failure does this catch?") is unanswerable.
+   - Any public method with 8+ tests — investigate whether the unit is too big or the tests are redundant.
+   - Hand-typed JSON masquerading as Shopify data in a test that claims to verify Shopify-shape behavior.
+7. **Legitimate interaction tests are not flagged.** State machine transitions, retry counts, event emissions that are part of the contract — these look like wiring but are the correct shape. The reviewer distinguishes "wiring that tests trivia" from "interaction that IS the contract."
 
-The reviewer's output includes a **contract-vs-wiring audit**: for each test added, a one-line classification (contract / wiring / unclear) with reasoning. Unclear tests are rejected back to CC for clarification.
+The reviewer's output includes a **test-by-test classification**: for each test added, one of `contract / legit-interaction / wiring / redundant / fixture-shape-mismatch` with one-line reasoning. Anything `wiring` or `redundant` is rejected. `fixture-shape-mismatch` means a test claims to test Shopify-shape behavior with hand-typed JSON — rejected, must use a real fixture or be reframed as a pure-logic test.
 
 ---
 
