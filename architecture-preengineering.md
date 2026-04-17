@@ -178,7 +178,7 @@ The normal input-build path *is* the resume path. No special-case code.
 | **Consumes from others** | D2 (Shopify Adapter), D3 (Mirror source reads + dest stamp writes), D1 (store identity) |
 | **External integrations** | None directly (through D2) |
 | **Observability / audit** | Per-phase: bulk op IDs, input row count, success count, per-line error list, timing. Per-job: total items created, total items updated, orphans handled (and how), translations registered. Every stamp traced to job + phase. |
-| **Open questions** | JSONB value-schema lock (one migration-#1 design pass). Maximum bulk op timeout before auto-cancel (trivial: pick a number, revisit). |
+| **Open questions** | Maximum bulk op timeout before auto-cancel (trivial: pick a number, revisit). |
 
 ---
 
@@ -282,19 +282,15 @@ Every Shopify error maps to one of three actions: `NO_RETRY`, `RETRY_SAME_INPUT`
 
 Grouped by urgency.
 
-**Need resolution before first code**
-
-1. **JSONB value-schema lock** for `Metafield.value` and `MetaobjectField.value` — keys, indexes, casts. Cheap in migration #1, painful later.
-
 **Deferred**
 
-2. Incremental pull via `updated_at` filters.
-3. CLI wrapper for scripting re-syncs.
-4. Per-error-code actionable UI copy for `RETRY_AFTER_CHANGE` (v1 ships a generic "fix at source" message + Shopify's error code verbatim; curate later).
+1. Incremental pull via `updated_at` filters.
+2. CLI wrapper for scripting re-syncs.
+3. Per-error-code actionable UI copy for `RETRY_AFTER_CHANGE` (v1 ships a generic "fix at source" message + Shopify's error code verbatim; curate later).
 
 **Decided**
 
-Solid Queue · Turbo Streams · Postgres · app namespace `p2d` · JSONB for arbitrary metafield values · scope-selector v1 shape (checkboxes + free-text query + single-product escape; collection picker to v1.1) · retry taxonomy (`NO_RETRY` / `RETRY_SAME_INPUT` / `RETRY_AFTER_CHANGE`) · retry back-off fixed 30s · verification = on-failure only · resume-from-phase-N in v1 via delta-input idempotency · Phase 6 orphan policy `OrphanPolicy` value object, default `:ignore`, `:mirror` never global · mirror staleness informational only (no enforcement).
+Solid Queue · Turbo Streams · Postgres dev/prod + in-memory SQLite test (hard portability rule, no adapter-specific code) · `text` + `serialize JSON` for metafield/metaobject values (not `jsonb`) · app namespace `p2d` · scope-selector v1 shape (checkboxes + free-text query + single-product escape; collection picker to v1.1) · retry taxonomy (`NO_RETRY` / `RETRY_SAME_INPUT` / `RETRY_AFTER_CHANGE`) · retry back-off fixed 30s · verification = on-failure only · resume-from-phase-N in v1 via delta-input idempotency · Phase 6 orphan policy `OrphanPolicy` value object, default `:ignore`, `:mirror` never global · mirror staleness informational only (no enforcement).
 
 ---
 
@@ -304,8 +300,8 @@ Dependency-driven build order.
 
 | Phase | Contents |
 |---|---|
-| Phase 0 | Resolve the JSONB value-schema lock. Stack is locked: Rails 8 auth, Postgres via docker-compose, Solid Queue, Turbo Streams, app namespace `p2d`. |
-| Phase 1 | Foundation — Rails 8 app scaffold, auth generator, ENV-seeded admin, docker-compose with Postgres, base layout |
+| Phase 0 | All design open questions resolved. Stack locked: Rails 8 auth, Postgres (dev/prod via docker-compose) + in-memory SQLite (test), Solid Queue, Turbo Streams, app namespace `p2d`. |
+| Phase 1 | Foundation — Rails 8 app scaffold, auth generator, ENV-seeded admin, docker-compose Postgres for dev, `config/database.yml` with SQLite `:memory:` test block, `sqlite_foreign_keys.rb` initializer, CI with main (SQLite) + parity canary (Postgres) jobs, base layout |
 | Phase 2 | D1 Stores & Credentials + D2 Shopify Adapter in parallel (both foundational; neither depends on the other) |
 | Phase 3 | D3 Mirror (schema + ingest API) — unblocks D4 and D5 |
 | Phase 4 | D4 Pull Engine — end-to-end pull working against a real source store before D5 starts |

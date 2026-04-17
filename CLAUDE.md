@@ -8,7 +8,7 @@ Standing orders for every CC task working on this project. Read top-to-bottom be
 
 p2d ("Prod-to-Dev Data Sync") is an open-source Ruby on Rails 8 developer tool. It copies Shopify catalog data **one-way** from a production Shopify store (source of truth) to one or more dev stores. It is self-hosted per developer — never a service, never multi-tenant.
 
-Stack: Rails 8, Postgres (via docker-compose in dev), Solid Queue, Turbo Streams, Rails 8 built-in auth, Shopify Admin GraphQL API 2026-01 (pinned).
+Stack: Rails 8, Postgres (via docker-compose for dev + prod), **in-memory SQLite for the test suite** (zero external service dependency — required because CC dispatches multiple agents in parallel worktrees), Solid Queue, Turbo Streams, Rails 8 built-in auth, Shopify Admin GraphQL API 2026-01 (pinned).
 
 The architecture is decomposed into six bounded domains + one cross-cutting adapter:
 
@@ -74,10 +74,23 @@ Do not introduce:
 - Devise or any third-party auth gem (Rails 8 built-in auth is the answer)
 - Sidekiq, Redis, or any other background runner (Solid Queue is the answer)
 - ActionCable handlers for live updates (Turbo Streams is the answer)
-- SQLite or any other DB (Postgres is the answer)
+- A different runtime DB than Postgres for dev/prod (see DB rule below)
 - A different Shopify API version (2026-01 is pinned)
 
 If you think one of these should change, the answer is: file an item in the decisions log and keep coding against the current stack. Do not quietly introduce a new dependency.
+
+### 7a. The DB portability rule (hard)
+
+The test suite runs against in-memory SQLite. Dev and production run against Postgres. This is a hard constraint because CC dispatches multiple agents in parallel worktrees and a shared Postgres creates port/schema contention that ruins the dispatch model.
+
+**Non-negotiable rules:**
+- **No Postgres-specific SQL in application code.** No `->`, `->>`, `@>`, `?`, `jsonb_*()`, array columns, or any adapter-specific syntax. If you think you need it, the answer is "no" — rewrite as Ruby or as a portable query.
+- **No `t.jsonb` columns.** Use `t.text` with `serialize :field, coder: JSON` at the model layer. Mirror stores metafield/metaobject values as opaque JSON strings; we never query into them.
+- **No escape-hatch "Postgres-only tests" tagged and excluded.** If a piece of code requires Postgres semantics, it doesn't belong in application code. Period.
+- **FK enforcement is on in SQLite** via a connection-setup initializer (`PRAGMA foreign_keys = ON`). This is set up once in `config/initializers`; do not remove it.
+- **A CI compatibility canary** runs the full test suite against real Postgres as a drift detector. If that canary fails, the cause is a portability violation — fix the code, don't exclude the test.
+
+See `validation-plan.md` §2.5 and Invariant 8.
 
 ---
 
